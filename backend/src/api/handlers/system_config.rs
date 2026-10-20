@@ -851,6 +851,51 @@ mod tests {
         );
     }
 
+    /// #4574: the stored hidden navigation entries reach an anonymous caller
+    /// as `ui.hidden_nav_items` (guests see the sidebar too), and a stored
+    /// value that is not a list of strings reads as nothing hidden.
+    #[tokio::test]
+    async fn test_handler_anonymous_gets_hidden_nav_items_4574() {
+        use crate::services::hidden_nav_items;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let before = hidden_nav_items::try_load(&pool).await.expect("read");
+        let state = tdh::build_state(pool.clone(), "/tmp/sysconfig-4574");
+
+        hidden_nav_items::store(&pool, &["/peers".to_string()], user_id)
+            .await
+            .expect("store");
+        let stored = call_handler(state.clone(), None).await;
+        sqlx::query("UPDATE system_settings SET value = '{\"not\": \"a list\"}' WHERE key = $1")
+            .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+            .execute(&pool)
+            .await
+            .expect("corrupt setting");
+        let malformed = call_handler(state, None).await;
+
+        if before.is_empty() {
+            sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+                .execute(&pool)
+                .await
+                .expect("cleanup setting");
+        } else {
+            hidden_nav_items::store(&pool, &before, user_id)
+                .await
+                .expect("restore setting");
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(
+            stored["ui"]["hidden_nav_items"],
+            serde_json::json!(["/peers"])
+        );
+        assert_eq!(malformed["ui"]["hidden_nav_items"], serde_json::json!([]));
+    }
+
     /// Authenticated non-admin caller: same redaction as anonymous — the
     /// `is_admin == false` path still drops the security-posture fields.
     #[tokio::test]
